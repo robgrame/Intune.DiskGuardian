@@ -1,13 +1,14 @@
 <#
 .SYNOPSIS
-    Queries Intune for devices non-compliant due to low disk space and adds
-    them to a designated Entra ID security group.
+    Bidirectional sync: adds non-compliant devices to an Entra group
+    and removes devices that have become compliant.
 
 .DESCRIPTION
     This script authenticates to Microsoft Graph using an App Registration
-    (client credentials flow), queries the Intune compliance state for devices
-    flagged by the custom "DiskSpace" compliance policy, and adds non-compliant
-    device objects to a target Entra ID group.
+    (client credentials flow), queries the Intune compliance state, and
+    performs a bidirectional sync with a target Entra ID security group:
+    - Devices flagged as non-compliant are ADDED to the group
+    - Devices that are no longer non-compliant are REMOVED from the group
 
     Designed to run as a Windows Scheduled Task or Azure Automation Runbook.
 
@@ -23,11 +24,7 @@
     a plain-text parameter.
 
 .PARAMETER EntraGroupId
-    Object ID of the Entra ID security group to add non-compliant devices to.
-
-.PARAMETER CompliancePolicyName
-    Display name of the Intune custom compliance policy to check against.
-    Default: "DiskSpace-Compliance".
+    Object ID of the Entra ID security group to sync non-compliant devices with.
 
 .EXAMPLE
     # Interactive (for testing)
@@ -67,9 +64,7 @@ param(
     [string]$ClientSecret,
 
     [Parameter(Mandatory)]
-    [string]$EntraGroupId,
-
-    [string]$CompliancePolicyName = "DiskSpace-Compliance"
+    [string]$EntraGroupId
 )
 
 $ErrorActionPreference = "Stop"
@@ -123,7 +118,7 @@ function Invoke-GraphGet {
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
-Write-Log "Starting non-compliant device sync..."
+Write-Log "Starting bidirectional device sync..."
 Write-Log "Target Entra group: $EntraGroupId"
 
 # 1. Authenticate
@@ -143,27 +138,36 @@ $nonCompliantDevices = Invoke-GraphGet `
 
 Write-Log "Found $($nonCompliantDevices.Count) non-compliant device(s) in Intune."
 
-if ($nonCompliantDevices.Count -eq 0) {
-    Write-Log "No non-compliant devices found. Exiting."
-    exit 0
+# Build a lookup set of non-compliant azureADDeviceIds
+$nonCompliantDeviceIds = @{}
+foreach ($device in $nonCompliantDevices) {
+    if ($device.azureADDeviceId) {
+        $nonCompliantDeviceIds[$device.azureADDeviceId] = $true
+    }
 }
 
-# 3. Get current members of the target Entra group (to avoid duplicate adds)
+# 3. Get current device members of the target Entra group
 Write-Log "Retrieving current members of Entra group..."
 $existingMembers = Invoke-GraphGet `
-    -Uri "https://graph.microsoft.com/v1.0/groups/$EntraGroupId/members/microsoft.graph.device?`$select=id,deviceId" `
+    -Uri "https://graph.microsoft.com/v1.0/groups/$EntraGroupId/members/microsoft.graph.device?`$select=id,deviceId,displayName" `
     -Headers $headers
 
-$existingDeviceIds = @{}
+# Map: deviceId -> { objectId, displayName }
+$existingDeviceMap = @{}
 foreach ($member in $existingMembers) {
-    $existingDeviceIds[$member.deviceId] = $member.id
+    if ($member.deviceId) {
+        $existingDeviceMap[$member.deviceId] = @{
+            ObjectId    = $member.id
+            DisplayName = $member.displayName
+        }
+    }
 }
-Write-Log "Group currently has $($existingDeviceIds.Count) device member(s)."
+Write-Log "Group currently has $($existingDeviceMap.Count) device member(s)."
 
-# 4. For each non-compliant device, look up its Entra device object and add to group
+# ── 4. ADD non-compliant devices not yet in the group ────────────────────────
 $addedCount = 0
-$skippedCount = 0
-$errorCount = 0
+$addSkippedCount = 0
+$addErrorCount = 0
 
 foreach ($device in $nonCompliantDevices) {
     $deviceName = $device.deviceName
@@ -171,14 +175,13 @@ foreach ($device in $nonCompliantDevices) {
 
     if (-not $azureADDeviceId) {
         Write-Log "Device '$deviceName' has no azureADDeviceId — skipping." "WARN"
-        $skippedCount++
+        $addSkippedCount++
         continue
     }
 
-    # Skip if already in the group
-    if ($existingDeviceIds.ContainsKey($azureADDeviceId)) {
-        Write-Log "Device '$deviceName' ($azureADDeviceId) already in group — skipping."
-        $skippedCount++
+    if ($existingDeviceMap.ContainsKey($azureADDeviceId)) {
+        Write-Log "Device '$deviceName' ($azureADDeviceId) already in group — skipping add."
+        $addSkippedCount++
         continue
     }
 
@@ -191,7 +194,7 @@ foreach ($device in $nonCompliantDevices) {
 
         if (-not $entraDevices.value -or $entraDevices.value.Count -eq 0) {
             Write-Log "Device '$deviceName' ($azureADDeviceId) not found in Entra ID — skipping." "WARN"
-            $skippedCount++
+            $addSkippedCount++
             continue
         }
 
@@ -199,7 +202,7 @@ foreach ($device in $nonCompliantDevices) {
     }
     catch {
         Write-Log "Failed to look up Entra device for '$deviceName': $($_.Exception.Message)" "ERROR"
-        $errorCount++
+        $addErrorCount++
         continue
     }
 
@@ -222,19 +225,58 @@ foreach ($device in $nonCompliantDevices) {
         $statusCode = $_.Exception.Response.StatusCode.value__
         if ($statusCode -eq 400) {
             Write-Log "Device '$deviceName' already a member (race condition) — skipping." "WARN"
-            $skippedCount++
+            $addSkippedCount++
         }
         else {
             Write-Log "Failed to add '$deviceName' to group: $($_.Exception.Message)" "ERROR"
-            $errorCount++
+            $addErrorCount++
         }
     }
 }
 
-# 5. Summary
+# ── 5. REMOVE devices from group that are now compliant ──────────────────────
+$removedCount = 0
+$removeSkippedCount = 0
+$removeErrorCount = 0
+
+foreach ($deviceId in $existingDeviceMap.Keys) {
+    if ($nonCompliantDeviceIds.ContainsKey($deviceId)) {
+        # Still non-compliant — keep in group
+        $removeSkippedCount++
+        continue
+    }
+
+    $info = $existingDeviceMap[$deviceId]
+    $objectId = $info.ObjectId
+    $displayName = $info.DisplayName
+
+    try {
+        Invoke-RestMethod `
+            -Method Delete `
+            -Uri "https://graph.microsoft.com/v1.0/groups/$EntraGroupId/members/$objectId/`$ref" `
+            -Headers $headers | Out-Null
+
+        Write-Log "Removed '$displayName' ($deviceId) from group — now compliant."
+        $removedCount++
+    }
+    catch {
+        $statusCode = $_.Exception.Response.StatusCode.value__
+        if ($statusCode -eq 404) {
+            Write-Log "Device '$displayName' ($deviceId) already removed (race condition)." "WARN"
+            $removeSkippedCount++
+        }
+        else {
+            Write-Log "Failed to remove '$displayName' ($deviceId) from group: $($_.Exception.Message)" "ERROR"
+            $removeErrorCount++
+        }
+    }
+}
+
+# ── 6. Summary ───────────────────────────────────────────────────────────────
 Write-Log "──────────────────────────────────"
-Write-Log "Sync complete."
+Write-Log "Bidirectional sync complete."
 Write-Log "  Added   : $addedCount"
-Write-Log "  Skipped : $skippedCount"
-Write-Log "  Errors  : $errorCount"
+Write-Log "  Removed : $removedCount"
+Write-Log "  Skipped : $($addSkippedCount + $removeSkippedCount) (add: $addSkippedCount, remove: $removeSkippedCount)"
+Write-Log "  Errors  : $($addErrorCount + $removeErrorCount) (add: $addErrorCount, remove: $removeErrorCount)"
 Write-Log "──────────────────────────────────"

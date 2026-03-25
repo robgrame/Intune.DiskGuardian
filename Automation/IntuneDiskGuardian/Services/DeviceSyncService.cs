@@ -6,33 +6,42 @@ namespace IntuneDiskGuardian.Services;
 
 /// <summary>
 /// Queries Intune via Microsoft Graph for non-compliant managed devices
-/// and adds them to a designated Entra ID security group.
+/// and performs bidirectional sync with an Entra ID security group:
+/// - Adds non-compliant devices to the group
+/// - Removes devices that have become compliant
 /// </summary>
 public sealed class DeviceSyncService(
     GraphServiceClient graphClient,
     ILogger<DeviceSyncService> logger)
 {
     /// <summary>
-    /// Runs a full sync cycle: queries non-compliant devices from Intune,
-    /// resolves their Entra device objects, and adds them to the target group.
+    /// Runs a full bidirectional sync cycle.
     /// </summary>
     public async Task SyncNonCompliantDevicesAsync(string entraGroupId, CancellationToken ct)
     {
-        logger.LogInformation("Starting non-compliant device sync to group {GroupId}...", entraGroupId);
+        logger.LogInformation("Starting bidirectional device sync for group {GroupId}...", entraGroupId);
 
         // 1. Get all non-compliant managed devices from Intune
         var nonCompliantDevices = await GetNonCompliantDevicesAsync(ct);
         logger.LogInformation("Found {Count} non-compliant device(s) in Intune.", nonCompliantDevices.Count);
 
-        if (nonCompliantDevices.Count == 0)
-            return;
+        // Build a set of non-compliant azureADDeviceIds for fast lookup
+        var nonCompliantDeviceIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var d in nonCompliantDevices)
+        {
+            if (!string.IsNullOrEmpty(d.AzureADDeviceId))
+                nonCompliantDeviceIds.Add(d.AzureADDeviceId);
+        }
 
-        // 2. Get current device members of the target group (to skip duplicates)
-        var existingDeviceIds = await GetGroupDeviceMembersAsync(entraGroupId, ct);
-        logger.LogInformation("Target group already has {Count} device member(s).", existingDeviceIds.Count);
+        // 2. Get current device members of the target group
+        var existingMembers = await GetGroupDeviceMembersAsync(entraGroupId, ct);
+        logger.LogInformation("Target group currently has {Count} device member(s).", existingMembers.Count);
 
-        // 3. Add missing devices to the group
-        int added = 0, skipped = 0, errors = 0;
+        var existingDeviceIds = new HashSet<string>(
+            existingMembers.Keys, StringComparer.OrdinalIgnoreCase);
+
+        // 3. ADD non-compliant devices that are not yet in the group
+        int added = 0, addSkipped = 0, addErrors = 0;
 
         foreach (var device in nonCompliantDevices)
         {
@@ -42,35 +51,54 @@ public sealed class DeviceSyncService(
             if (string.IsNullOrEmpty(azureAdDeviceId))
             {
                 logger.LogWarning("Device '{DeviceName}' has no AzureADDeviceId — skipping.", deviceName);
-                skipped++;
+                addSkipped++;
                 continue;
             }
 
             if (existingDeviceIds.Contains(azureAdDeviceId))
             {
-                logger.LogDebug("Device '{DeviceName}' already in group — skipping.", deviceName);
-                skipped++;
+                logger.LogDebug("Device '{DeviceName}' already in group — skipping add.", deviceName);
+                addSkipped++;
                 continue;
             }
 
-            // Look up the Entra directory device object
             var entraObjectId = await ResolveEntraDeviceObjectIdAsync(azureAdDeviceId, deviceName, ct);
             if (entraObjectId is null)
             {
-                skipped++;
+                addSkipped++;
                 continue;
             }
 
-            // Add to group
             if (await TryAddDeviceToGroupAsync(entraGroupId, entraObjectId, deviceName, ct))
                 added++;
             else
-                errors++;
+                addErrors++;
+        }
+
+        // 4. REMOVE devices from group that are now compliant
+        int removed = 0, removeSkipped = 0, removeErrors = 0;
+
+        foreach (var (deviceId, entraObjectId) in existingMembers)
+        {
+            if (nonCompliantDeviceIds.Contains(deviceId))
+            {
+                // Still non-compliant — keep in group
+                removeSkipped++;
+                continue;
+            }
+
+            // Device is no longer non-compliant — remove from group
+            if (await TryRemoveDeviceFromGroupAsync(entraGroupId, entraObjectId, deviceId, ct))
+                removed++;
+            else
+                removeErrors++;
         }
 
         logger.LogInformation(
-            "Sync complete — Added: {Added}, Skipped: {Skipped}, Errors: {Errors}",
-            added, skipped, errors);
+            "Sync complete — Added: {Added}, Removed: {Removed}, " +
+            "Add-Skipped: {AddSkipped}, Remove-Skipped: {RemoveSkipped}, " +
+            "Add-Errors: {AddErrors}, Remove-Errors: {RemoveErrors}",
+            added, removed, addSkipped, removeSkipped, addErrors, removeErrors);
     }
 
     private async Task<List<ManagedDevice>> GetNonCompliantDevicesAsync(CancellationToken ct)
@@ -104,9 +132,13 @@ public sealed class DeviceSyncService(
         return devices;
     }
 
-    private async Task<HashSet<string>> GetGroupDeviceMembersAsync(string groupId, CancellationToken ct)
+    /// <summary>
+    /// Returns a dictionary of deviceId → entraObjectId for all device members of the group.
+    /// </summary>
+    private async Task<Dictionary<string, string>> GetGroupDeviceMembersAsync(
+        string groupId, CancellationToken ct)
     {
-        var deviceIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var members = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         var response = await graphClient.Groups[groupId].Members.GraphDevice
             .GetAsync(config =>
@@ -120,15 +152,15 @@ public sealed class DeviceSyncService(
             var pageIterator = PageIterator<Device, DeviceCollectionResponse>
                 .CreatePageIterator(graphClient, response, device =>
                 {
-                    if (!string.IsNullOrEmpty(device.DeviceId))
-                        deviceIds.Add(device.DeviceId);
+                    if (!string.IsNullOrEmpty(device.DeviceId) && !string.IsNullOrEmpty(device.Id))
+                        members[device.DeviceId] = device.Id;
                     return true;
                 });
 
             await pageIterator.IterateAsync(ct);
         }
 
-        return deviceIds;
+        return members;
     }
 
     private async Task<string?> ResolveEntraDeviceObjectIdAsync(
@@ -187,6 +219,31 @@ public sealed class DeviceSyncService(
         catch (Exception ex)
         {
             logger.LogError(ex, "Failed to add '{DeviceName}' to group.", deviceName);
+            return false;
+        }
+    }
+
+    private async Task<bool> TryRemoveDeviceFromGroupAsync(
+        string groupId, string deviceObjectId, string deviceId, CancellationToken ct)
+    {
+        try
+        {
+            await graphClient.Groups[groupId].Members[deviceObjectId].Ref
+                .DeleteAsync(cancellationToken: ct);
+
+            logger.LogInformation(
+                "Removed device {DeviceId} (object {ObjectId}) from group — now compliant.",
+                deviceId, deviceObjectId);
+            return true;
+        }
+        catch (ODataError ex) when (ex.ResponseStatusCode == 404)
+        {
+            logger.LogDebug("Device {DeviceId} already removed from group (race condition).", deviceId);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to remove device {DeviceId} from group.", deviceId);
             return false;
         }
     }
