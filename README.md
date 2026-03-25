@@ -14,7 +14,7 @@ Automated solution for **Microsoft Intune** that detects Windows devices with lo
 |-----------|------|-------------|
 | **Custom Compliance Policy** | `ComplianceScripts/` | Intune detection script + compliance JSON — flags devices with < 25 GB free |
 | **Azure Logic App (Bicep)** | `main.bicep` | Serverless Logic App that reads Intune inventory and adds low-disk devices to an Entra group |
-| **.NET 10 Worker Service** | `Automation/DiskSpaceSync/` | Long-running background service that queries Graph API and syncs non-compliant devices to an Entra group |
+| **.NET 10 Worker Service** | `Automation/IntuneDiskGuardian/` | Long-running background service that queries Graph API and syncs non-compliant devices to an Entra group |
 | **PowerShell Automation** | `Automation/` | Standalone scripts for the same sync workflow + Windows Scheduled Task setup |
 | **App Registration** | `Automation/Register-App.ps1` | Creates the Entra app with least-privilege Graph permissions |
 | **Graph Permissions** | `grant-graph-permissions.ps1` | Grants Graph API permissions to the Logic App's Managed Identity |
@@ -84,13 +84,13 @@ Save the output (`TenantId`, `ClientId`, `ClientSecret`) securely — ideally in
 #### Option A — .NET 10 Worker Service
 
 ```bash
-cd Automation/DiskSpaceSync
+cd Automation/IntuneDiskGuardian
 
 # Store secrets with .NET User Secrets (never in appsettings.json)
-dotnet user-secrets set "DiskSpaceSync:TenantId"     "<YOUR-TENANT-ID>"
-dotnet user-secrets set "DiskSpaceSync:ClientId"      "<YOUR-CLIENT-ID>"
-dotnet user-secrets set "DiskSpaceSync:ClientSecret"   "<YOUR-CLIENT-SECRET>"
-dotnet user-secrets set "DiskSpaceSync:EntraGroupId"   "<YOUR-GROUP-OBJECT-ID>"
+dotnet user-secrets set "IntuneDiskGuardian:TenantId"     "<YOUR-TENANT-ID>"
+dotnet user-secrets set "IntuneDiskGuardian:ClientId"      "<YOUR-CLIENT-ID>"
+dotnet user-secrets set "IntuneDiskGuardian:ClientSecret"   "<YOUR-CLIENT-SECRET>"
+dotnet user-secrets set "IntuneDiskGuardian:EntraGroupId"   "<YOUR-GROUP-OBJECT-ID>"
 
 dotnet run
 ```
@@ -99,7 +99,7 @@ Configuration in `appsettings.json`:
 
 ```jsonc
 {
-  "DiskSpaceSync": {
+  "IntuneDiskGuardian": {
     "TenantId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
     "ClientId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
     "ClientSecret": "use-user-secrets-or-keyvault",
@@ -123,10 +123,10 @@ Configuration in `appsettings.json`:
 #### Option C — Azure Logic App (Serverless)
 
 ```bash
-az group create --name rg-check-disk-space --location westeurope
+az group create --name rg-intune-disk-guardian --location westeurope
 
 az deployment group create \
-  --resource-group rg-check-disk-space \
+  --resource-group rg-intune-disk-guardian \
   --template-file main.bicep \
   --parameters main.bicepparam
 
@@ -200,11 +200,11 @@ CheckDiskSpace/
 │   ├── Register-App.ps1                 # App Registration setup
 │   ├── Sync-NonCompliantDevices.ps1     # PowerShell sync script
 │   ├── Setup-ScheduledTask.ps1          # Scheduled Task installer
-│   └── DiskSpaceSync/                   # .NET 10 Worker Service
+│   └── IntuneDiskGuardian/                   # .NET 10 Worker Service
 │       ├── Program.cs
 │       ├── Worker.cs
 │       ├── Configuration/
-│       │   └── DiskSpaceSyncOptions.cs
+│       │   └── IntuneDiskGuardianOptions.cs
 │       ├── Services/
 │       │   └── DeviceSyncService.cs
 │       └── appsettings.json

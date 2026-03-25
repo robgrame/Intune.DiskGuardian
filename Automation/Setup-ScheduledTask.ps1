@@ -44,7 +44,7 @@ param(
     [Parameter(Mandatory)][string]$ClientId,
     [Parameter(Mandatory)][string]$ClientSecret,
     [Parameter(Mandatory)][string]$EntraGroupId,
-    [string]$TaskName = "Intune-DiskSpace-Sync",
+    [string]$TaskName = "IntuneDiskGuardian",
     [Parameter(Mandatory)][string]$ScriptPath
 )
 
@@ -92,7 +92,7 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Settings $settings `
     -Principal $principal `
-    -Description "Syncs Intune non-compliant (low disk space) devices to an Entra ID group." `
+    -Description "IntuneDiskGuardian — Syncs non-compliant (low disk space) devices to an Entra ID group." `
     -Force
 
 Write-Host "`nScheduled Task '$TaskName' created successfully." -ForegroundColor Green

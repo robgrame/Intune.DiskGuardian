@@ -4,7 +4,9 @@
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <UserSecretsId>dotnet-DiskSpaceSync-7e22ca07-0492-4b25-b4a9-c5130192cbdf</UserSecretsId>
+    <RootNamespace>IntuneDiskGuardian</RootNamespace>
+    <AssemblyName>IntuneDiskGuardian</AssemblyName>
+    <UserSecretsId>dotnet-IntuneDiskGuardian-7e22ca07-0492-4b25-b4a9-c5130192cbdf</UserSecretsId>
   </PropertyGroup>
 
   <ItemGroup>

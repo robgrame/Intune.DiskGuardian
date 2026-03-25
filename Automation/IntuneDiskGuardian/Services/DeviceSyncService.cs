@@ -2,7 +2,7 @@ using Microsoft.Graph;
 using Microsoft.Graph.Models;
 using Microsoft.Graph.Models.ODataErrors;
 
-namespace DiskSpaceSync.Services;
+namespace IntuneDiskGuardian.Services;
 
 /// <summary>
 /// Queries Intune via Microsoft Graph for non-compliant managed devices

@@ -1,7 +1,7 @@
 ﻿{
   "$schema": "https://json.schemastore.org/launchsettings.json",
   "profiles": {
-    "DiskSpaceSync": {
+    "IntuneDiskGuardian": {
       "commandName": "Project",
       "dotnetRunMessages": true,
       "environmentVariables": {

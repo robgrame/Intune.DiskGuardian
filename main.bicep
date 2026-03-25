@@ -1,11 +1,11 @@
 // ================================================================
-// CheckDiskSpace - Azure Logic App
+// IntuneDiskGuardian - Azure Logic App
 // Reads Intune device inventory and adds devices with < 25 GB
 // free disk space to an Entra ID group.
 // ================================================================
 
 @description('Name of the Logic App')
-param logicAppName string = 'logic-check-disk-space'
+param logicAppName string = 'logic-intune-disk-guardian'
 
 @description('Azure region for the Logic App')
 param location string = resourceGroup().location

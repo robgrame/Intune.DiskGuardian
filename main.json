@@ -11,7 +11,7 @@
   "parameters": {
     "logicAppName": {
       "type": "string",
-      "defaultValue": "logic-check-disk-space",
+      "defaultValue": "logic-intune-disk-guardian",
       "metadata": {
         "description": "Name of the Logic App"
       }

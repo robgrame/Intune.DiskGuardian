@@ -1,12 +1,12 @@
-namespace DiskSpaceSync.Configuration;
+namespace IntuneDiskGuardian.Configuration;
 
 /// <summary>
-/// Strongly-typed configuration for the DiskSpaceSync worker.
-/// Bound from the "DiskSpaceSync" section in appsettings.json.
+/// Strongly-typed configuration for the IntuneDiskGuardian worker.
+/// Bound from the "IntuneDiskGuardian" section in appsettings.json.
 /// </summary>
-public sealed class DiskSpaceSyncOptions
+public sealed class IntuneDiskGuardianOptions
 {
-    public const string SectionName = "DiskSpaceSync";
+    public const string SectionName = "IntuneDiskGuardian";
 
     /// <summary>Azure AD / Entra tenant ID.</summary>
     public required string TenantId { get; set; }

@@ -1,8 +1,8 @@
-using DiskSpaceSync.Configuration;
-using DiskSpaceSync.Services;
+using IntuneDiskGuardian.Configuration;
+using IntuneDiskGuardian.Services;
 using Microsoft.Extensions.Options;
 
-namespace DiskSpaceSync;
+namespace IntuneDiskGuardian;
 
 /// <summary>
 /// Background worker that periodically syncs non-compliant Intune devices
@@ -10,7 +10,7 @@ namespace DiskSpaceSync;
 /// </summary>
 public sealed class Worker(
     DeviceSyncService syncService,
-    IOptions<DiskSpaceSyncOptions> options,
+    IOptions<IntuneDiskGuardianOptions> options,
     ILogger<Worker> logger) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -18,7 +18,7 @@ public sealed class Worker(
         var config = options.Value;
 
         logger.LogInformation(
-            "DiskSpaceSync worker started. Sync interval: {Interval}. Target group: {GroupId}.",
+            "IntuneDiskGuardian worker started. Sync interval: {Interval}. Target group: {GroupId}.",
             config.SyncInterval, config.EntraGroupId);
 
         // Run immediately on startup, then on interval
@@ -40,6 +40,6 @@ public sealed class Worker(
             await Task.Delay(config.SyncInterval, stoppingToken);
         }
 
-        logger.LogInformation("DiskSpaceSync worker stopping.");
+        logger.LogInformation("IntuneDiskGuardian worker stopping.");
     }
 }

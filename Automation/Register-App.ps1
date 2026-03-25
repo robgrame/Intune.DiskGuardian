@@ -28,7 +28,7 @@
 #>
 
 param(
-    [string]$AppDisplayName = "Intune-DiskSpace-Sync"
+    [string]$AppDisplayName = "IntuneDiskGuardian"
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,7 +41,7 @@ $requiredPermissions = @(
     "Device.Read.All"                            # Look up device objects in Entra
 )
 
-Write-Host "`n=== Intune Disk Space Sync — App Registration ===" -ForegroundColor Cyan
+Write-Host "`n=== IntuneDiskGuardian — App Registration ===" -ForegroundColor Cyan
 Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Gray
 
 Connect-MgGraph -Scopes @(
