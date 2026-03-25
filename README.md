@@ -1,4 +1,4 @@
-# Intune Disk Space Compliance & Auto-Remediation
+# IntuneDiskGuardian
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![.NET](https://img.shields.io/badge/.NET-10.0-purple)](https://dotnet.microsoft.com/)
