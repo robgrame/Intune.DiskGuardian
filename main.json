@@ -1,0 +1,286 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.40.2.10011",
+      "templateHash": "15080983192727995183"
+    }
+  },
+  "parameters": {
+    "logicAppName": {
+      "type": "string",
+      "defaultValue": "logic-check-disk-space",
+      "metadata": {
+        "description": "Name of the Logic App"
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for the Logic App"
+      }
+    },
+    "sourceGroupObjectId": {
+      "type": "string",
+      "metadata": {
+        "description": "Object ID of the Entra ID source group containing the devices to check"
+      }
+    },
+    "entraGroupObjectId": {
+      "type": "string",
+      "metadata": {
+        "description": "Object ID of the Entra ID destination group where low-disk devices will be added"
+      }
+    },
+    "thresholdGB": {
+      "type": "int",
+      "defaultValue": 25,
+      "metadata": {
+        "description": "Free disk space threshold in GB. Devices below this are added to the group."
+      }
+    },
+    "recurrenceIntervalHours": {
+      "type": "int",
+      "defaultValue": 24,
+      "metadata": {
+        "description": "Recurrence interval in hours"
+      }
+    }
+  },
+  "variables": {
+    "thresholdBytes": "[mul(parameters('thresholdGB'), 1073741824)]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Logic/workflows",
+      "apiVersion": "2019-05-01",
+      "name": "[parameters('logicAppName')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "state": "Enabled",
+        "definition": {
+          "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "sourceGroupObjectId": {
+              "type": "String",
+              "defaultValue": "[parameters('sourceGroupObjectId')]"
+            },
+            "entraGroupObjectId": {
+              "type": "String",
+              "defaultValue": "[parameters('entraGroupObjectId')]"
+            },
+            "thresholdBytes": {
+              "type": "Int",
+              "defaultValue": "[variables('thresholdBytes')]"
+            }
+          },
+          "triggers": {
+            "Recurrence": {
+              "type": "Recurrence",
+              "recurrence": {
+                "frequency": "Hour",
+                "interval": "[parameters('recurrenceIntervalHours')]",
+                "timeZone": "UTC"
+              }
+            }
+          },
+          "actions": {
+            "Initialize_NextLink": {
+              "type": "InitializeVariable",
+              "runAfter": {},
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "nextLink",
+                    "type": "string",
+                    "value": "https://graph.microsoft.com/v1.0/groups/@{parameters('sourceGroupObjectId')}/members/microsoft.graph.device?$select=id,deviceId,displayName&$top=100"
+                  }
+                ]
+              }
+            },
+            "Initialize_DevicesAdded": {
+              "type": "InitializeVariable",
+              "runAfter": {
+                "Initialize_NextLink": [
+                  "Succeeded"
+                ]
+              },
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "devicesAdded",
+                    "type": "integer",
+                    "value": 0
+                  }
+                ]
+              }
+            },
+            "Until_No_More_Pages": {
+              "type": "Until",
+              "expression": "@equals(variables('nextLink'), '')",
+              "limit": {
+                "count": 50,
+                "timeout": "PT1H"
+              },
+              "runAfter": {
+                "Initialize_DevicesAdded": [
+                  "Succeeded"
+                ]
+              },
+              "actions": {
+                "Get_Group_Members_Page": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "GET",
+                    "uri": "@variables('nextLink')",
+                    "authentication": {
+                      "type": "ManagedServiceIdentity",
+                      "audience": "https://graph.microsoft.com"
+                    }
+                  }
+                },
+                "Set_NextLink": {
+                  "type": "SetVariable",
+                  "runAfter": {
+                    "Get_Group_Members_Page": [
+                      "Succeeded"
+                    ]
+                  },
+                  "inputs": {
+                    "name": "nextLink",
+                    "value": "@{coalesce(body('Get_Group_Members_Page')?['@odata.nextLink'], '')}"
+                  }
+                },
+                "For_Each_Device": {
+                  "type": "Foreach",
+                  "runAfter": {
+                    "Set_NextLink": [
+                      "Succeeded"
+                    ]
+                  },
+                  "foreach": "@body('Get_Group_Members_Page')?['value']",
+                  "actions": {
+                    "Lookup_Intune_Device": {
+                      "type": "Http",
+                      "inputs": {
+                        "method": "GET",
+                        "uri": "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$filter=azureADDeviceId eq '@{items('For_Each_Device')?['deviceId']}'&$select=id,deviceName,freeStorageSpaceInBytes,azureADDeviceId",
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "audience": "https://graph.microsoft.com"
+                        }
+                      }
+                    },
+                    "Check_Intune_Device_Found": {
+                      "type": "If",
+                      "runAfter": {
+                        "Lookup_Intune_Device": [
+                          "Succeeded"
+                        ]
+                      },
+                      "expression": {
+                        "and": [
+                          {
+                            "greater": [
+                              "@length(body('Lookup_Intune_Device')?['value'])",
+                              0
+                            ]
+                          }
+                        ]
+                      },
+                      "actions": {
+                        "Check_Free_Space": {
+                          "type": "If",
+                          "expression": {
+                            "and": [
+                              {
+                                "greater": [
+                                  "@body('Lookup_Intune_Device')?['value'][0]?['freeStorageSpaceInBytes']",
+                                  0
+                                ]
+                              },
+                              {
+                                "less": [
+                                  "@body('Lookup_Intune_Device')?['value'][0]?['freeStorageSpaceInBytes']",
+                                  "@parameters('thresholdBytes')"
+                                ]
+                              }
+                            ]
+                          },
+                          "actions": {
+                            "Add_Device_To_Group": {
+                              "type": "Http",
+                              "inputs": {
+                                "method": "POST",
+                                "uri": "https://graph.microsoft.com/v1.0/groups/@{parameters('entraGroupObjectId')}/members/$ref",
+                                "headers": {
+                                  "Content-Type": "application/json"
+                                },
+                                "body": {
+                                  "@@odata.id": "https://graph.microsoft.com/v1.0/directoryObjects/@{items('For_Each_Device')?['id']}"
+                                },
+                                "authentication": {
+                                  "type": "ManagedServiceIdentity",
+                                  "audience": "https://graph.microsoft.com"
+                                }
+                              }
+                            },
+                            "Increment_Counter": {
+                              "type": "IncrementVariable",
+                              "runAfter": {
+                                "Add_Device_To_Group": [
+                                  "Succeeded"
+                                ]
+                              },
+                              "inputs": {
+                                "name": "devicesAdded",
+                                "value": 1
+                              }
+                            }
+                          },
+                          "else": {
+                            "actions": {}
+                          }
+                        }
+                      },
+                      "else": {
+                        "actions": {}
+                      }
+                    }
+                  },
+                  "operationOptions": "Sequential"
+                }
+              }
+            }
+          },
+          "outputs": {}
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "logicAppName": {
+      "type": "string",
+      "value": "[parameters('logicAppName')]"
+    },
+    "logicAppId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Logic/workflows', parameters('logicAppName'))]"
+    },
+    "managedIdentityPrincipalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Logic/workflows', parameters('logicAppName')), '2019-05-01', 'full').identity.principalId]"
+    },
+    "managedIdentityTenantId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Logic/workflows', parameters('logicAppName')), '2019-05-01', 'full').identity.tenantId]"
+    }
+  }
+}

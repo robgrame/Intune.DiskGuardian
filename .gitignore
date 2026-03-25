@@ -1,0 +1,28 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.vs/
+.vscode/
+*.DotSettings.user
+
+# User secrets
+secrets.json
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE
+.idea/
+*.swp
+*~
+
+# Build artifacts
+publish/
+out/
+
+# Internal planning notes
+plan.md
