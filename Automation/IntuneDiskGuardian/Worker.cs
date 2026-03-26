@@ -26,7 +26,8 @@ public sealed class Worker(
         {
             try
             {
-                await syncService.SyncNonCompliantDevicesAsync(config.EntraGroupId, stoppingToken);
+                await syncService.SyncDevicesAsync(
+                    config.EntraGroupId, config.HealthScriptId, config.ThresholdGB, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {

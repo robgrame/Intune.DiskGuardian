@@ -44,6 +44,8 @@ param(
     [Parameter(Mandatory)][string]$ClientId,
     [Parameter(Mandatory)][string]$ClientSecret,
     [Parameter(Mandatory)][string]$EntraGroupId,
+    [Parameter(Mandatory)][string]$HealthScriptId,
+    [double]$ThresholdGB = 25,
     [string]$TaskName = "IntuneDiskGuardian",
     [Parameter(Mandatory)][string]$ScriptPath
 )
@@ -64,6 +66,8 @@ $arguments = @(
     "-ClientId `"$ClientId`""
     "-ClientSecret `"$ClientSecret`""
     "-EntraGroupId `"$EntraGroupId`""
+    "-HealthScriptId `"$HealthScriptId`""
+    "-ThresholdGB $ThresholdGB"
 ) -join " "
 
 $action = New-ScheduledTaskAction `

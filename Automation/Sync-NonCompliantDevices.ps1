@@ -1,14 +1,15 @@
 <#
 .SYNOPSIS
-    Bidirectional sync: adds non-compliant devices to an Entra group
-    and removes devices that have become compliant.
+    Bidirectional sync based on Intune Proactive Remediation results.
+    Adds devices with low disk space to an Entra group, removes those
+    that have recovered.
 
 .DESCRIPTION
     This script authenticates to Microsoft Graph using an App Registration
-    (client credentials flow), queries the Intune compliance state, and
-    performs a bidirectional sync with a target Entra ID security group:
-    - Devices flagged as non-compliant are ADDED to the group
-    - Devices that are no longer non-compliant are REMOVED from the group
+    (client credentials flow), queries the Intune Device Health Script
+    (Proactive Remediation) run states to determine which devices have
+    low disk space, and performs bidirectional sync with a target Entra
+    ID security group.
 
     Designed to run as a Windows Scheduled Task or Azure Automation Runbook.
 
@@ -20,31 +21,30 @@
 
 .PARAMETER ClientSecret
     App Registration client secret. For production, retrieve this from
-    Azure Key Vault or Windows Credential Manager instead of passing as
-    a plain-text parameter.
+    Azure Key Vault or Windows Credential Manager.
 
 .PARAMETER EntraGroupId
-    Object ID of the Entra ID security group to sync non-compliant devices with.
+    Object ID of the Entra ID security group to sync devices with.
+
+.PARAMETER HealthScriptId
+    Intune Device Health Script (Proactive Remediation) ID.
+    Find it via Graph: GET deviceManagement/deviceHealthScripts
+    or in the Intune portal URL.
+
+.PARAMETER ThresholdGB
+    Free disk space threshold in GB. Must match the detection script.
+    Default: 25.
 
 .EXAMPLE
-    # Interactive (for testing)
     .\Sync-NonCompliantDevices.ps1 `
         -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
         -ClientId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
         -ClientSecret "your-secret-here" `
-        -EntraGroupId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-
-.EXAMPLE
-    # Scheduled Task (retrieve secret from environment variable)
-    .\Sync-NonCompliantDevices.ps1 `
-        -TenantId $env:TENANT_ID `
-        -ClientId $env:CLIENT_ID `
-        -ClientSecret $env:CLIENT_SECRET `
-        -EntraGroupId $env:ENTRA_GROUP_ID
+        -EntraGroupId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+        -HealthScriptId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
 .NOTES
     Required Graph Application Permissions:
-    - DeviceManagementManagedDevices.Read.All
     - DeviceManagementConfiguration.Read.All
     - GroupMember.ReadWrite.All
     - Device.Read.All
@@ -64,7 +64,12 @@ param(
     [string]$ClientSecret,
 
     [Parameter(Mandatory)]
-    [string]$EntraGroupId
+    [string]$EntraGroupId,
+
+    [Parameter(Mandatory)]
+    [string]$HealthScriptId,
+
+    [double]$ThresholdGB = 25
 )
 
 $ErrorActionPreference = "Stop"
@@ -119,40 +124,69 @@ function Invoke-GraphGet {
 # ══════════════════════════════════════════════════════════════════════════════
 
 Write-Log "Starting bidirectional device sync..."
+Write-Log "Health Script ID: $HealthScriptId"
+Write-Log "Threshold: $ThresholdGB GB"
 Write-Log "Target Entra group: $EntraGroupId"
 
 # 1. Authenticate
 Write-Log "Authenticating to Microsoft Graph..."
 $token = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
 $headers = @{
-    Authorization  = "Bearer $token"
-    "Content-Type" = "application/json"
+    Authorization    = "Bearer $token"
+    "Content-Type"   = "application/json"
     ConsistencyLevel = "eventual"
 }
 
-# 2. Get all non-compliant managed devices from Intune
-Write-Log "Querying Intune for non-compliant devices..."
-$nonCompliantDevices = Invoke-GraphGet `
-    -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$filter=complianceState eq 'noncompliant'&`$select=id,deviceName,azureADDeviceId,complianceState,freeStorageSpaceInBytes" `
+# 2. Query Health Script device run states (beta endpoint)
+Write-Log "Querying Proactive Remediation run states..."
+$runStates = Invoke-GraphGet `
+    -Uri "https://graph.microsoft.com/beta/deviceManagement/deviceHealthScripts/$HealthScriptId/deviceRunStates?`$expand=managedDevice(`$select=id,deviceName,azureADDeviceId)&`$select=detectionState,preRemediationDetectionScriptOutput&`$top=100" `
     -Headers $headers
 
-Write-Log "Found $($nonCompliantDevices.Count) non-compliant device(s) in Intune."
+Write-Log "Retrieved $($runStates.Count) device run state(s)."
 
-# Build a lookup set of non-compliant azureADDeviceIds
-$nonCompliantDeviceIds = @{}
-foreach ($device in $nonCompliantDevices) {
-    if ($device.azureADDeviceId) {
-        $nonCompliantDeviceIds[$device.azureADDeviceId] = $true
+# 3. Identify devices with low disk space
+$lowDiskDevices = @{}  # azureADDeviceId -> deviceName
+
+foreach ($state in $runStates) {
+    $managedDevice = $state.managedDevice
+    if (-not $managedDevice) { continue }
+
+    $azureADDeviceId = $managedDevice.azureADDeviceId
+    $deviceName = $managedDevice.deviceName
+
+    if (-not $azureADDeviceId) { continue }
+
+    $isLowDisk = ($state.detectionState -eq "fail")
+
+    # Try to parse the script output for more accurate check
+    $scriptOutput = $state.preRemediationDetectionScriptOutput
+    if ($scriptOutput) {
+        try {
+            $parsed = $scriptOutput | ConvertFrom-Json
+            if ($null -ne $parsed.FreeSpaceGB) {
+                $isLowDisk = ($parsed.FreeSpaceGB -lt $ThresholdGB)
+                Write-Log "  $deviceName : $($parsed.FreeSpaceGB) GB free $(if ($isLowDisk) {'→ LOW'} else {'→ OK'})"
+            }
+        }
+        catch {
+            # Fall back to detectionState
+        }
+    }
+
+    if ($isLowDisk) {
+        $lowDiskDevices[$azureADDeviceId] = $deviceName
     }
 }
 
-# 3. Get current device members of the target Entra group
+Write-Log "Found $($lowDiskDevices.Count) device(s) with low disk space."
+
+# 4. Get current device members of the target Entra group
 Write-Log "Retrieving current members of Entra group..."
 $existingMembers = Invoke-GraphGet `
-    -Uri "https://graph.microsoft.com/v1.0/groups/$EntraGroupId/members/microsoft.graph.device?`$select=id,deviceId,displayName" `
+    -Uri "https://graph.microsoft.com/v1.0/groups/$EntraGroupId/members/microsoft.graph.device?`$select=id,deviceId,displayName&`$top=100" `
     -Headers $headers
 
-# Map: deviceId -> { objectId, displayName }
 $existingDeviceMap = @{}
 foreach ($member in $existingMembers) {
     if ($member.deviceId) {
@@ -164,28 +198,20 @@ foreach ($member in $existingMembers) {
 }
 Write-Log "Group currently has $($existingDeviceMap.Count) device member(s)."
 
-# ── 4. ADD non-compliant devices not yet in the group ────────────────────────
+# ── 5. ADD low-disk devices not yet in the group ─────────────────────────────
 $addedCount = 0
 $addSkippedCount = 0
 $addErrorCount = 0
 
-foreach ($device in $nonCompliantDevices) {
-    $deviceName = $device.deviceName
-    $azureADDeviceId = $device.azureADDeviceId
-
-    if (-not $azureADDeviceId) {
-        Write-Log "Device '$deviceName' has no azureADDeviceId — skipping." "WARN"
-        $addSkippedCount++
-        continue
-    }
+foreach ($azureADDeviceId in $lowDiskDevices.Keys) {
+    $deviceName = $lowDiskDevices[$azureADDeviceId]
 
     if ($existingDeviceMap.ContainsKey($azureADDeviceId)) {
-        Write-Log "Device '$deviceName' ($azureADDeviceId) already in group — skipping add."
         $addSkippedCount++
         continue
     }
 
-    # Look up the Entra device object by deviceId
+    # Look up the Entra device object
     try {
         $entraDevices = Invoke-RestMethod `
             -Method Get `
@@ -206,7 +232,6 @@ foreach ($device in $nonCompliantDevices) {
         continue
     }
 
-    # Add the device to the group
     try {
         $addBody = @{
             "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$entraDeviceObjectId"
@@ -234,14 +259,13 @@ foreach ($device in $nonCompliantDevices) {
     }
 }
 
-# ── 5. REMOVE devices from group that are now compliant ──────────────────────
+# ── 6. REMOVE devices from group that no longer have low disk space ──────────
 $removedCount = 0
 $removeSkippedCount = 0
 $removeErrorCount = 0
 
 foreach ($deviceId in $existingDeviceMap.Keys) {
-    if ($nonCompliantDeviceIds.ContainsKey($deviceId)) {
-        # Still non-compliant — keep in group
+    if ($lowDiskDevices.ContainsKey($deviceId)) {
         $removeSkippedCount++
         continue
     }
@@ -256,7 +280,7 @@ foreach ($deviceId in $existingDeviceMap.Keys) {
             -Uri "https://graph.microsoft.com/v1.0/groups/$EntraGroupId/members/$objectId/`$ref" `
             -Headers $headers | Out-Null
 
-        Write-Log "Removed '$displayName' ($deviceId) from group — now compliant."
+        Write-Log "Removed '$displayName' ($deviceId) from group — disk space OK."
         $removedCount++
     }
     catch {
@@ -266,13 +290,13 @@ foreach ($deviceId in $existingDeviceMap.Keys) {
             $removeSkippedCount++
         }
         else {
-            Write-Log "Failed to remove '$displayName' ($deviceId) from group: $($_.Exception.Message)" "ERROR"
+            Write-Log "Failed to remove '$displayName' ($deviceId): $($_.Exception.Message)" "ERROR"
             $removeErrorCount++
         }
     }
 }
 
-# ── 6. Summary ───────────────────────────────────────────────────────────────
+# ── 7. Summary ───────────────────────────────────────────────────────────────
 Write-Log "──────────────────────────────────"
 Write-Log "Bidirectional sync complete."
 Write-Log "  Added   : $addedCount"

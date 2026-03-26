@@ -35,9 +35,8 @@ $ErrorActionPreference = "Stop"
 
 # Required Microsoft Graph application permissions
 $requiredPermissions = @(
-    "DeviceManagementManagedDevices.Read.All",   # Read Intune managed devices
-    "DeviceManagementConfiguration.Read.All",    # Read compliance policy states
-    "GroupMember.ReadWrite.All",                  # Add devices to Entra group
+    "DeviceManagementConfiguration.Read.All",    # Read health script / remediation run states
+    "GroupMember.ReadWrite.All",                  # Add/remove devices in the Entra group
     "Device.Read.All"                            # Look up device objects in Entra
 )
 

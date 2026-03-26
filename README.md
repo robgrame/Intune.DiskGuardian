@@ -4,7 +4,7 @@
 [![.NET](https://img.shields.io/badge/.NET-10.0-purple)](https://dotnet.microsoft.com/)
 [![Azure](https://img.shields.io/badge/Azure-Logic%20App%20%7C%20Graph%20API-0078D4)](https://azure.microsoft.com/)
 
-Automated solution for **Microsoft Intune** that detects Windows devices with low free disk space, marks them as **non-compliant** via a Custom Compliance Policy, and performs **bidirectional sync** with an **Entra ID security group**: non-compliant devices are added, and devices that become compliant again are automatically removed.
+Automated solution for **Microsoft Intune** that detects Windows devices with low free disk space using **Proactive Remediations** and performs **bidirectional sync** with an **Entra ID security group**: devices with low disk space are added, and devices that recover are automatically removed.
 
 ---
 
@@ -12,9 +12,9 @@ Automated solution for **Microsoft Intune** that detects Windows devices with lo
 
 | Component | Path | Description |
 |-----------|------|-------------|
-| **Custom Compliance Policy** | `ComplianceScripts/` | Intune detection script + compliance JSON — flags devices with < 25 GB free |
+| **Proactive Remediation Scripts** | `RemediationScripts/` | Detection script (checks free space, exit 0/1) + optional remediation script (cleans temp files) |
 | **Azure Logic App (Bicep)** | `main.bicep` | Serverless Logic App that reads Intune inventory and adds low-disk devices to an Entra group |
-| **.NET 10 Worker Service** | `Automation/IntuneDiskGuardian/` | Long-running background service — bidirectional sync: adds non-compliant devices, removes compliant ones |
+| **.NET 10 Worker Service** | `Automation/IntuneDiskGuardian/` | Long-running background service — reads remediation results via Graph API, bidirectional group sync |
 | **PowerShell Automation** | `Automation/` | Standalone scripts for the same bidirectional sync + Windows Scheduled Task setup |
 | **App Registration** | `Automation/Register-App.ps1` | Creates the Entra app with least-privilege Graph permissions |
 | **Graph Permissions** | `grant-graph-permissions.ps1` | Grants Graph API permissions to the Logic App's Managed Identity |
@@ -25,14 +25,15 @@ Automated solution for **Microsoft Intune** that detects Windows devices with lo
 
 ```
 ┌────────────────────┐      ┌──────────────────────┐      ┌────────────────────────┐
-│  Intune Custom     │      │  .NET Worker Service  │      │  Entra ID Group        │
-│  Compliance Policy │      │  (or Logic App /      │      │  "Devices-LowDisk"     │
-│                    │      │   PowerShell script)  │      │                        │
-│  Check-DiskSpace   │      │                       │      │  Targeted policies:    │
-│  runs on device    │─────►│  Queries Graph API    │─────►│  - Cleanup scripts     │
-│  < 25 GB = fail    │      │  for non-compliant    │      │  - Conditional Access  │
-│                    │      │  devices & removes    │      │  - Notifications       │
-│                    │      │  compliant ones       │      │                        │
+│  Intune Proactive  │      │  .NET Worker Service  │      │  Entra ID Group        │
+│  Remediation       │      │  (or PowerShell /     │      │  "Devices-LowDisk"     │
+│                    │      │   Logic App)          │      │                        │
+│  Detect-LowDisk    │      │                       │      │  Targeted policies:    │
+│  runs on device    │─────►│  Reads health script  │─────►│  - Cleanup scripts     │
+│  < 25 GB = exit 1  │      │  run states via Graph │      │  - Conditional Access  │
+│                    │      │  Adds/removes devices │      │  - Notifications       │
+│  Remediate-LowDisk │      │  bidirectionally      │      │                        │
+│  cleans temp files │      │                       │      │                        │
 └────────────────────┘      └──────────────────────┘      └────────────────────────┘
 ```
 
@@ -62,15 +63,20 @@ Automated solution for **Microsoft Intune** that detects Windows devices with lo
 
 ## 🚀 Quick Start
 
-### Step 1 — Deploy the Custom Compliance Policy in Intune
+### Step 1 — Deploy the Proactive Remediation in Intune
 
-1. **Intune admin center** → Devices → Compliance → Scripts → **Add** (Windows 10 and later)
-2. Upload `ComplianceScripts/Check-DiskSpace.ps1` as the **Discovery script**
-3. Compliance policies → **Create policy** → Windows 10+ → **Custom Compliance**
-4. Select the discovery script → upload `ComplianceScripts/DiskSpace-CompliancePolicy.json`
-5. Assign the policy to your device groups
+1. **Intune admin center** → Devices → Remediations → **Create script package**
+2. Name: `IntuneDiskGuardian - Low Disk Space`
+3. Upload `RemediationScripts/Detect-LowDiskSpace.ps1` as the **Detection script**
+4. Upload `RemediationScripts/Remediate-LowDiskSpace.ps1` as the **Remediation script** (optional — cleans temp files)
+5. Set **Run this script using the logged-on credentials**: No (run as SYSTEM)
+6. Assign to your device groups and configure the **Schedule** (e.g., every 1 hour, daily)
+7. After deploying, note the **Health Script ID** from the Intune portal URL or via Graph:
+   ```
+   GET https://graph.microsoft.com/beta/deviceManagement/deviceHealthScripts
+   ```
 
-Devices with less than **25 GB** free on the system drive will be flagged as **non-compliant**. When a device frees up space and becomes compliant again, it will be **automatically removed** from the group at the next sync cycle.
+Devices with less than **25 GB** free on the system drive will report `exit 1` (issue detected). When a device frees up space, the next run reports `exit 0` and it will be **automatically removed** from the group at the next sync cycle.
 
 ### Step 2 — Create the App Registration
 
@@ -88,10 +94,11 @@ Save the output (`TenantId`, `ClientId`, `ClientSecret`) securely — ideally in
 cd Automation/IntuneDiskGuardian
 
 # Store secrets with .NET User Secrets (never in appsettings.json)
-dotnet user-secrets set "IntuneDiskGuardian:TenantId"     "<YOUR-TENANT-ID>"
-dotnet user-secrets set "IntuneDiskGuardian:ClientId"      "<YOUR-CLIENT-ID>"
-dotnet user-secrets set "IntuneDiskGuardian:ClientSecret"   "<YOUR-CLIENT-SECRET>"
-dotnet user-secrets set "IntuneDiskGuardian:EntraGroupId"   "<YOUR-GROUP-OBJECT-ID>"
+dotnet user-secrets set "IntuneDiskGuardian:TenantId"       "<YOUR-TENANT-ID>"
+dotnet user-secrets set "IntuneDiskGuardian:ClientId"        "<YOUR-CLIENT-ID>"
+dotnet user-secrets set "IntuneDiskGuardian:ClientSecret"     "<YOUR-CLIENT-SECRET>"
+dotnet user-secrets set "IntuneDiskGuardian:EntraGroupId"     "<YOUR-GROUP-OBJECT-ID>"
+dotnet user-secrets set "IntuneDiskGuardian:HealthScriptId"   "<YOUR-HEALTH-SCRIPT-ID>"
 
 dotnet run
 ```
@@ -105,6 +112,8 @@ Configuration in `appsettings.json`:
     "ClientId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
     "ClientSecret": "use-user-secrets-or-keyvault",
     "EntraGroupId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "HealthScriptId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "ThresholdGB": 25,
     "SyncInterval": "01:00:00"
   }
 }
@@ -114,11 +123,12 @@ Configuration in `appsettings.json`:
 
 ```powershell
 .\Automation\Setup-ScheduledTask.ps1 `
-    -TenantId     "<TENANT-ID>" `
-    -ClientId     "<CLIENT-ID>" `
-    -ClientSecret "<CLIENT-SECRET>" `
-    -EntraGroupId "<GROUP-ID>" `
-    -ScriptPath   "C:\Scripts\Sync-NonCompliantDevices.ps1"
+    -TenantId       "<TENANT-ID>" `
+    -ClientId       "<CLIENT-ID>" `
+    -ClientSecret   "<CLIENT-SECRET>" `
+    -EntraGroupId   "<GROUP-ID>" `
+    -HealthScriptId "<HEALTH-SCRIPT-ID>" `
+    -ScriptPath     "C:\Scripts\Sync-NonCompliantDevices.ps1"
 ```
 
 #### Option C — Azure Logic App (Serverless)
@@ -141,8 +151,7 @@ az deployment group create \
 
 | Permission | Type | Purpose |
 |------------|------|---------|
-| `DeviceManagementManagedDevices.Read.All` | Application | Read Intune device inventory and compliance state |
-| `DeviceManagementConfiguration.Read.All` | Application | Read compliance policy details |
+| `DeviceManagementConfiguration.Read.All` | Application | Read Proactive Remediation (health script) run states |
 | `GroupMember.ReadWrite.All` | Application | Add/remove devices in the Entra group |
 | `Device.Read.All` | Application | Resolve device objects in Entra ID |
 
@@ -154,15 +163,13 @@ All permissions follow the **least-privilege** principle. The `Register-App.ps1`
 
 ### Change the Disk Space Threshold
 
-Edit `ComplianceScripts/DiskSpace-CompliancePolicy.json`:
+Edit `RemediationScripts/Detect-LowDiskSpace.ps1` — change the `$thresholdGB` variable:
 
-```json
-{
-  "SettingName": "FreeSpaceGB",
-  "Operator": "IsGreaterEqual",
-  "Operand": 25
-}
+```powershell
+$thresholdGB = 25   # Change this value
 ```
+
+Also update `ThresholdGB` in the Worker Service config / PowerShell parameter to match.
 
 Change `25` to your desired threshold in GB.
 
@@ -193,15 +200,15 @@ Format: `HH:mm:ss` (e.g., `00:30:00` = every 30 minutes).
 ## 🗂️ Project Structure
 
 ```
-CheckDiskSpace/
-├── ComplianceScripts/
-│   ├── Check-DiskSpace.ps1              # Intune detection script (runs on device)
-│   └── DiskSpace-CompliancePolicy.json  # Compliance rule definition
+IntuneDiskGuardian/
+├── RemediationScripts/
+│   ├── Detect-LowDiskSpace.ps1              # Proactive Remediation detection (runs on device)
+│   └── Remediate-LowDiskSpace.ps1           # Optional: cleans temp files to free space
 ├── Automation/
-│   ├── Register-App.ps1                 # App Registration setup
-│   ├── Sync-NonCompliantDevices.ps1     # PowerShell sync script
-│   ├── Setup-ScheduledTask.ps1          # Scheduled Task installer
-│   └── IntuneDiskGuardian/                   # .NET 10 Worker Service
+│   ├── Register-App.ps1                     # App Registration setup
+│   ├── Sync-NonCompliantDevices.ps1         # PowerShell sync script
+│   ├── Setup-ScheduledTask.ps1              # Scheduled Task installer
+│   └── IntuneDiskGuardian/                  # .NET 10 Worker Service
 │       ├── Program.cs
 │       ├── Worker.cs
 │       ├── Configuration/
@@ -209,10 +216,10 @@ CheckDiskSpace/
 │       ├── Services/
 │       │   └── DeviceSyncService.cs
 │       └── appsettings.json
-├── main.bicep                           # Logic App infrastructure (Bicep)
-├── main.bicepparam                      # Deployment parameters
-├── main.json                            # Compiled ARM template
-└── grant-graph-permissions.ps1          # Graph permissions for Managed Identity
+├── main.bicep                               # Logic App infrastructure (Bicep)
+├── main.bicepparam                          # Deployment parameters
+├── main.json                                # Compiled ARM template
+└── grant-graph-permissions.ps1              # Graph permissions for Managed Identity
 ```
 
 ---

@@ -1,61 +1,50 @@
+using System.Text.Json;
 using Microsoft.Graph;
 using Microsoft.Graph.Models;
 using Microsoft.Graph.Models.ODataErrors;
+using Microsoft.Kiota.Abstractions;
 
 namespace IntuneDiskGuardian.Services;
 
 /// <summary>
-/// Queries Intune via Microsoft Graph for non-compliant managed devices
-/// and performs bidirectional sync with an Entra ID security group:
-/// - Adds non-compliant devices to the group
-/// - Removes devices that have become compliant
+/// Reads Intune Proactive Remediation (Device Health Script) run states
+/// to identify devices with low disk space, then performs bidirectional
+/// sync with an Entra ID security group.
 /// </summary>
 public sealed class DeviceSyncService(
     GraphServiceClient graphClient,
     ILogger<DeviceSyncService> logger)
 {
     /// <summary>
-    /// Runs a full bidirectional sync cycle.
+    /// Runs a full bidirectional sync cycle based on remediation script results.
     /// </summary>
-    public async Task SyncNonCompliantDevicesAsync(string entraGroupId, CancellationToken ct)
+    public async Task SyncDevicesAsync(
+        string entraGroupId,
+        string healthScriptId,
+        double thresholdGB,
+        CancellationToken ct)
     {
-        logger.LogInformation("Starting bidirectional device sync for group {GroupId}...", entraGroupId);
+        logger.LogInformation(
+            "Starting bidirectional sync — HealthScript: {ScriptId}, Threshold: {Threshold} GB, Group: {GroupId}",
+            healthScriptId, thresholdGB, entraGroupId);
 
-        // 1. Get all non-compliant managed devices from Intune
-        var nonCompliantDevices = await GetNonCompliantDevicesAsync(ct);
-        logger.LogInformation("Found {Count} non-compliant device(s) in Intune.", nonCompliantDevices.Count);
+        // 1. Query the health script run states to find devices with low disk space
+        var lowDiskDeviceIds = await GetLowDiskDeviceIdsFromHealthScriptAsync(
+            healthScriptId, thresholdGB, ct);
 
-        // Build a set of non-compliant azureADDeviceIds for fast lookup
-        var nonCompliantDeviceIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var d in nonCompliantDevices)
-        {
-            if (!string.IsNullOrEmpty(d.AzureADDeviceId))
-                nonCompliantDeviceIds.Add(d.AzureADDeviceId);
-        }
+        logger.LogInformation("Found {Count} device(s) with low disk space from remediation results.",
+            lowDiskDeviceIds.Count);
 
         // 2. Get current device members of the target group
         var existingMembers = await GetGroupDeviceMembersAsync(entraGroupId, ct);
         logger.LogInformation("Target group currently has {Count} device member(s).", existingMembers.Count);
 
-        var existingDeviceIds = new HashSet<string>(
-            existingMembers.Keys, StringComparer.OrdinalIgnoreCase);
-
-        // 3. ADD non-compliant devices that are not yet in the group
+        // 3. ADD low-disk devices that are not yet in the group
         int added = 0, addSkipped = 0, addErrors = 0;
 
-        foreach (var device in nonCompliantDevices)
+        foreach (var (azureAdDeviceId, deviceName) in lowDiskDeviceIds)
         {
-            var azureAdDeviceId = device.AzureADDeviceId;
-            var deviceName = device.DeviceName ?? "unknown";
-
-            if (string.IsNullOrEmpty(azureAdDeviceId))
-            {
-                logger.LogWarning("Device '{DeviceName}' has no AzureADDeviceId — skipping.", deviceName);
-                addSkipped++;
-                continue;
-            }
-
-            if (existingDeviceIds.Contains(azureAdDeviceId))
+            if (existingMembers.ContainsKey(azureAdDeviceId))
             {
                 logger.LogDebug("Device '{DeviceName}' already in group — skipping add.", deviceName);
                 addSkipped++;
@@ -75,19 +64,17 @@ public sealed class DeviceSyncService(
                 addErrors++;
         }
 
-        // 4. REMOVE devices from group that are now compliant
+        // 4. REMOVE devices from group that no longer have low disk space
         int removed = 0, removeSkipped = 0, removeErrors = 0;
 
         foreach (var (deviceId, entraObjectId) in existingMembers)
         {
-            if (nonCompliantDeviceIds.Contains(deviceId))
+            if (lowDiskDeviceIds.ContainsKey(deviceId))
             {
-                // Still non-compliant — keep in group
                 removeSkipped++;
                 continue;
             }
 
-            // Device is no longer non-compliant — remove from group
             if (await TryRemoveDeviceFromGroupAsync(entraGroupId, entraObjectId, deviceId, ct))
                 removed++;
             else
@@ -101,35 +88,112 @@ public sealed class DeviceSyncService(
             added, removed, addSkipped, removeSkipped, addErrors, removeErrors);
     }
 
-    private async Task<List<ManagedDevice>> GetNonCompliantDevicesAsync(CancellationToken ct)
+    /// <summary>
+    /// Queries deviceHealthScripts/{id}/deviceRunStates to find devices where
+    /// the detection script reported low disk space (detectionState = "fail"
+    /// or parsed output FreeSpaceGB &lt; threshold).
+    /// Returns a dictionary of azureADDeviceId → deviceName.
+    /// </summary>
+    private async Task<Dictionary<string, string>> GetLowDiskDeviceIdsFromHealthScriptAsync(
+        string healthScriptId, double thresholdGB, CancellationToken ct)
     {
-        var devices = new List<ManagedDevice>();
+        var lowDiskDevices = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var nextLink =
+            $"https://graph.microsoft.com/beta/deviceManagement/deviceHealthScripts/{healthScriptId}/deviceRunStates" +
+            "?$expand=managedDevice($select=id,deviceName,azureADDeviceId)" +
+            "&$select=detectionState,preRemediationDetectionScriptOutput" +
+            "&$top=100";
 
-        var response = await graphClient.DeviceManagement.ManagedDevices
-            .GetAsync(config =>
-            {
-                config.QueryParameters.Filter = "complianceState eq 'noncompliant'";
-                config.QueryParameters.Select =
-                [
-                    "id", "deviceName", "azureADDeviceId",
-                    "complianceState", "freeStorageSpaceInBytes"
-                ];
-                config.QueryParameters.Top = 100;
-            }, ct);
-
-        if (response?.Value is not null)
+        while (!string.IsNullOrEmpty(nextLink))
         {
-            var pageIterator = PageIterator<ManagedDevice, ManagedDeviceCollectionResponse>
-                .CreatePageIterator(graphClient, response, device =>
-                {
-                    devices.Add(device);
-                    return true;
-                });
+            ct.ThrowIfCancellationRequested();
 
-            await pageIterator.IterateAsync(ct);
+            var requestInfo = new RequestInformation
+            {
+                HttpMethod = Method.GET,
+                URI = new Uri(nextLink)
+            };
+
+            var response = await graphClient.RequestAdapter.SendPrimitiveAsync<Stream>(
+                requestInfo, cancellationToken: ct);
+
+            if (response is null) break;
+
+            using var doc = await JsonDocument.ParseAsync(response, cancellationToken: ct);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("value", out var values))
+            {
+                foreach (var runState in values.EnumerateArray())
+                {
+                    ProcessRunState(runState, thresholdGB, lowDiskDevices);
+                }
+            }
+
+            nextLink = root.TryGetProperty("@odata.nextLink", out var nl)
+                ? nl.GetString()
+                : null;
         }
 
-        return devices;
+        return lowDiskDevices;
+    }
+
+    private void ProcessRunState(
+        JsonElement runState,
+        double thresholdGB,
+        Dictionary<string, string> lowDiskDevices)
+    {
+        // Get the managed device info from the $expand
+        if (!runState.TryGetProperty("managedDevice", out var managedDevice))
+            return;
+
+        var azureAdDeviceId = managedDevice.TryGetProperty("azureADDeviceId", out var adId)
+            ? adId.GetString() : null;
+        var deviceName = managedDevice.TryGetProperty("deviceName", out var dn)
+            ? dn.GetString() : "unknown";
+
+        if (string.IsNullOrEmpty(azureAdDeviceId))
+            return;
+
+        // Check detectionState — "fail" means the detection script exited with code 1
+        var detectionState = runState.TryGetProperty("detectionState", out var ds)
+            ? ds.GetString() : null;
+
+        bool isLowDisk = string.Equals(detectionState, "fail", StringComparison.OrdinalIgnoreCase);
+
+        // Also try to parse the script output for a more accurate threshold check
+        if (runState.TryGetProperty("preRemediationDetectionScriptOutput", out var outputProp))
+        {
+            var outputStr = outputProp.GetString();
+            if (!string.IsNullOrWhiteSpace(outputStr))
+            {
+                try
+                {
+                    using var outputDoc = JsonDocument.Parse(outputStr);
+                    if (outputDoc.RootElement.TryGetProperty("FreeSpaceGB", out var freeSpace))
+                    {
+                        var freeGB = freeSpace.GetDouble();
+                        isLowDisk = freeGB < thresholdGB;
+
+                        logger.LogDebug(
+                            "Device '{DeviceName}': {FreeGB} GB free (threshold: {Threshold} GB) → {Status}",
+                            deviceName, freeGB, thresholdGB, isLowDisk ? "LOW" : "OK");
+                    }
+                }
+                catch (JsonException)
+                {
+                    // Output is not valid JSON — fall back to detectionState
+                    logger.LogDebug(
+                        "Device '{DeviceName}': could not parse script output, using detectionState={State}",
+                        deviceName, detectionState);
+                }
+            }
+        }
+
+        if (isLowDisk)
+        {
+            lowDiskDevices[azureAdDeviceId] = deviceName ?? "unknown";
+        }
     }
 
     /// <summary>
@@ -232,7 +296,7 @@ public sealed class DeviceSyncService(
                 .DeleteAsync(cancellationToken: ct);
 
             logger.LogInformation(
-                "Removed device {DeviceId} (object {ObjectId}) from group — now compliant.",
+                "Removed device {DeviceId} (object {ObjectId}) from group — disk space OK.",
                 deviceId, deviceObjectId);
             return true;
         }
